@@ -1,0 +1,7 @@
+{
+  "name": "lazertur-assistente",
+  "private": true,
+  "workspaces": [
+    "frontend"
+  ]
+}
