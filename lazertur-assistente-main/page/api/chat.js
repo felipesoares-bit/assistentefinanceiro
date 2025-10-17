@@ -1,74 +1,107 @@
-/**
- * Serverless API endpoint for Vercel / other Node server.
- * Expects environment variables:
- *   OPENAI_API_KEY - your API key
- *   OPENAI_ASSISTANT_ID - (optional) assistant id (e.g. asst_...)
- *
- * Note: set these in Vercel dashboard (Project Settings > Environment Variables).
- *
- * This handler will try to call the Assistants endpoint if OPENAI_ASSISTANT_ID is present.
- * Otherwise it falls back to the chat completions via the official OpenAI SDK approach.
- */
+// api/chat.js
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID;
 
-import fetch from 'node-fetch'
+// Habilita CORS básico (ajuste a origem conforme necessário)
+const withCors = (res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+};
 
 export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' })
-  }
-  const { message } = req.body || {}
-  if (!message) return res.status(400).json({ error: 'Missing message' })
+  withCors(res);
 
-  const API_KEY = process.env.OPENAI_API_KEY
-  const ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID // use the assistant id the user provided
-  if (!API_KEY) return res.status(500).json({ error: 'OPENAI_API_KEY not configured' })
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  try{
-    if (ASSISTANT_ID) {
-      // Using the Assistants API endpoint (best effort - ensure your environment supports it)
-      const assistantUrl = `https://api.openai.com/v1/assistants/${ASSISTANT_ID}/message`
-      const payload = {
-        input: {
-          role: "user",
-          content: message
-        }
-      }
-      const r = await fetch(assistantUrl, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-      })
-      const j = await r.json()
-      // The structure may differ depending on the API response shape; try to extract text:
-      const reply = j?.output?.[0]?.content?.[0]?.text || j?.error?.message || JSON.stringify(j)
-      return res.status(200).json({ reply })
-    } else {
-      // Fallback to Chat Completions (gpt-3.5-turbo / gpt-4o-mini)
-      const url = 'https://api.openai.com/v1/chat/completions'
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          model: 'gpt-4o-mini',
-          messages: [
-            { role: 'system', content: 'Você é Lu, assistente virtual da Lazertur.' },
-            { role: 'user', content: message }
-          ],
-          max_tokens: 500
-        })
-      })
-      const j = await r.json()
-      const reply = j?.choices?.[0]?.message?.content || j?.error?.message || JSON.stringify(j)
-      return res.status(200).json({ reply })
+  try {
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ error: 'OPENAI_API_KEY não configurada' });
     }
-  }catch(err){
-    console.error('API error', err)
-    return res.status(500).json({ error: 'Server error', details: String(err) })
+
+    const { message } = req.body || {};
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ error: 'Campo "message" é obrigatório' });
+    }
+
+    // --- Modo Assistants (se houver ID) ---
+    if (ASSISTANT_ID) {
+      // 1) cria thread
+      const threadRes = await fetch('https://api.openai.com/v1/threads', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({})
+      });
+      const thread = await threadRes.json();
+
+      // 2) adiciona mensagem do usuário
+      await fetch(`https://api.openai.com/v1/threads/${thread.id}/messages`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ role: 'user', content: message })
+      });
+
+      // 3) cria run
+      let run = await (await fetch(`https://api.openai.com/v1/threads/${thread.id}/runs`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ assistant_id: ASSISTANT_ID })
+      })).json();
+
+      // 4) poll até completar (timeout simples)
+      const started = Date.now();
+      while (run.status !== 'completed') {
+        if (['failed', 'cancelled', 'expired'].includes(run.status)) {
+          return res.status(500).json({ error: `Run ${run.status}` });
+        }
+        if (Date.now() - started > 60_000) {
+          return res.status(504).json({ error: 'Timeout ao aguardar resposta do Assistente' });
+        }
+        await new Promise(r => setTimeout(r, 1000));
+        run = await (await fetch(`https://api.openai.com/v1/threads/${thread.id}/runs/${run.id}`, {
+          headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}` }
+        })).json();
+      }
+
+      // 5) pega última resposta
+      const msgs = await (await fetch(`https://api.openai.com/v1/threads/${thread.id}/messages?limit=1`, {
+        headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}` }
+      })).json();
+
+      const ai = msgs.data?.[0]?.content?.[0]?.text?.value || '(sem conteúdo)';
+      return res.status(200).json({ reply: ai, threadId: thread.id });
+    }
+
+    // --- Fallback Chat Completions ---
+    const completion = await (await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'Você é um assistente útil.' },
+          { role: 'user', content: message }
+        ]
+      })
+    })).json();
+
+    const ai = completion.choices?.[0]?.message?.content || '(sem conteúdo)';
+    return res.status(200).json({ reply: ai });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Erro inesperado no servidor' });
   }
 }
